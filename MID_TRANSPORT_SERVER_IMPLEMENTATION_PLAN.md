@@ -1,749 +1,424 @@
 # 中转服务器服务端实现计划
 
-## 1. 背景与目标
+## 1. 定位
 
-`Mid_transport_server` 作为公网侧中转服务端，负责把公网访问者的 TCP 连接转发到已经建立隧道的下游节点。
+`Mid_transport_server` 不是一套新的隧道协议，也不是控制平面系统。
 
-本计划只描述中转服务器服务端本身，不绑定任何具体业务服务端、客户端实现、GUI 程序或内部业务协议。中转服务器只处理连接接入、隧道会话、路由绑定、鉴权、流量转发和观测，不解析业务 payload。
+它只是一个部署在中转服务器上的轻量转发节点：
+
+```text
+入口 TCP 流量
+  -> 中转服务器
+  -> Xray 协议链路
+  -> 目标方向
+```
+
+Xray 已经负责连接建立、协议握手、加密、认证、传输和转发能力。中转服务器服务端不要重复实现这些能力，也不要另起一套调度或控制协议。
+
+本仓库第一版只需要把“中转节点如何启动、如何配置、如何转发、如何观察状态”规划清楚。
+
+## 2. 核心目标
 
 第一版目标：
 
 ```text
-1. 对公网暴露一个或多个 TCP 入口端口。
-2. 接受下游节点主动连入并建立持久隧道会话。
-3. 将公网入口连接与可用下游隧道会话配对。
-4. 透明转发双向字节流。
-5. 记录公网访问者 source IP:port、入口 destination IP:port、routeId、sessionId、connectionId。
-6. 默认安全，不成为无鉴权开放代理。
-7. 支持最小可运维日志、指标和连接清理。
+1. 在中转服务器上提供一个可部署的转发服务。
+2. 使用固定版本的 Xray-core 作为实际隧道/代理内核。
+3. 按配置监听入口端口。
+4. 按配置把流量转发到指定出口。
+5. 不解析、不修改、不理解业务 payload。
+6. 不实现自定义控制协议。
+7. 不和任何具体业务端代码耦合。
+8. 提供最小日志、配置校验、启动停止和连通性验证。
 ```
 
-## 2. 范围边界
+## 3. 本次不做什么
 
-### 2.1 本次覆盖
+明确不做：
 
 ```text
-- 公网 TCP 入口监听。
-- 隧道控制监听。
-- 下游节点鉴权。
-- 路由注册与端口绑定。
-- 公网连接与隧道连接配对。
-- 透明 TCP 字节流转发。
-- 连接生命周期管理。
-- 日志、指标、限流和错误处理。
-- 服务端配置文件和部署方式。
+- 不自研隧道协议。
+- 不设计独立控制平面。
+- 不设计额外数据通道。
+- 不做动态调度系统。
+- 不解析业务协议。
+- 不修改 TCP payload。
+- 不感知数据库同步、文件传输、插件消息等业务。
+- 不和任意具体业务服务端绑定。
 ```
 
-### 2.2 本次不覆盖
+中转服务器只处理转发链路本身。业务端内部怎么处理收到的字节流，和中转服务器无关。
+
+## 4. 推荐架构
+
+第一版推荐直接把中转服务器做成 Xray-core 的部署封装。
 
 ```text
-- 任意具体业务端程序的内部协议。
-- 任意 GUI 或桌面端配置界面。
-- 下游节点的具体实现代码。
-- 业务 payload 解密、识别、修改或重封包。
-- 数据库同步、文件传输、插件协议等业务层逻辑。
-- 和其他仓库的强耦合调用。
+Mid_transport_server
+  ├─ 读取配置
+  ├─ 校验端口和目标地址
+  ├─ 生成或加载 Xray 配置
+  ├─ 启动 Xray-core
+  ├─ 监控 Xray 进程/实例状态
+  └─ 输出日志和健康状态
 ```
 
-中转服务器只把公网连接送入隧道，并把下游返回的数据送回公网连接。业务端如何处理收到的字节流，不属于本计划。
-
-## 3. 核心架构
-
-推荐第一版采用两个平面：
+实际转发由 Xray 完成：
 
 ```text
-公网访问平面 Public Ingress
-  - 监听对外服务端口
-  - 接受访问者 TCP 连接
-  - 生成 connectionId
-  - 记录 source/destination metadata
-
-隧道控制平面 Tunnel Control
-  - 监听下游节点控制连接
-  - 鉴权并注册 agent/session
-  - 管理 routeId -> agent/session 的映射
-  - 为公网连接分配可用隧道
+公网入口
+  -> Xray inbound
+  -> Xray outbound
+  -> 下一跳 / 目标地址
 ```
 
-逻辑拓扑：
+如果第一版不想写太多代码，也可以先把本仓库定位为：
 
 ```text
-公网访问者
-  -> Mid_transport_server public listen port
-  -> route table 匹配 routeId
-  -> 已认证下游 session
-  -> tunnel data channel
-  -> 下游节点
+- Xray 配置模板
+- 启停脚本
+- 部署文档
+- 连通性测试脚本
 ```
 
-中转服务器不关心下游节点背后的真实服务类型，只关心 route 是否在线、是否有容量、是否允许当前入口端口转发。
+等部署流程稳定后，再封装成守护进程或服务。
 
-## 4. 基础概念
+## 5. 运行模式
 
-### 4.1 Agent
+### 5.1 外部 xray 可执行文件模式
 
-下游主动连入中转服务器的一端，代表一个可接收转发流量的节点。
+中转服务器上可以直接运行固定版本的 `xray` 可执行文件。
 
-字段建议：
+优点：
 
 ```text
-agentId
-name
-secretHash 或 publicKey
-allowedRoutes
-maxSessions
-maxConnections
-createdAt
-lastSeenAt
-enabled
+- 最简单。
+- 和 Xray 官方运行方式一致。
+- 崩溃隔离好。
+- 易于 systemd / Docker 管理。
 ```
 
-### 4.2 Session
-
-Agent 与中转服务器之间的一条已认证控制连接或复用连接。
-
-字段建议：
+中转服务程序只负责：
 
 ```text
-sessionId
-agentId
-remoteAddress
-protocolVersion
-authenticatedAt
-lastHeartbeatAt
-activeConnectionCount
-maxConnectionCount
-state
+- 检查 xray 文件是否存在。
+- 检查配置是否存在。
+- 启动/停止 xray。
+- 记录 stdout/stderr。
+- 失败时退出或重启。
 ```
 
-### 4.3 Route
+### 5.2 仅配置仓库模式
 
-公网入口到下游 agent 的转发规则。
+如果不需要额外服务程序，本仓库可以只维护中转服务器配置和部署脚本。
 
-字段建议：
+目录可以是：
 
 ```text
-routeId
-name
-listenAddress
-listenPort
-agentId
-enabled
-maxConnections
-idleTimeoutSeconds
-connectTimeoutSeconds
-allowSourceCidrs
+configs/
+  xray.server.example.json
+scripts/
+  install.ps1 或 install.sh
+  start.ps1 或 start.sh
+  stop.ps1 或 stop.sh
+README.md
 ```
 
-### 4.4 Connection
+这种方式最符合“只是负责转发”的定位。
 
-一条公网访问者 TCP 连接与一条下游数据通道的配对。
+### 5.3 不建议第一版做 DLL 嵌入
 
-字段建议：
+中转服务器通常运行在独立服务器上，没必要为了“无额外进程”把 Xray-core 编成 DLL。
 
-```text
-connectionId
-routeId
-sessionId
-publicSourceAddress
-publicSourcePort
-publicDestinationAddress
-publicDestinationPort
-openedAt
-closedAt
-bytesFromPublic
-bytesToPublic
-closeReason
-```
+DLL 嵌入适合需要把 Xray 放进某个现有宿主进程的场景。中转服务器本身就是转发节点，直接运行 xray 可执行文件或容器更简单。
 
-## 5. 协议选择
+## 6. 配置模型
 
-第一版建议采用简单、可调试的协议，不急于做复杂多路复用。
-
-推荐方式：
-
-```text
-- 控制连接：TCP + TLS，JSON Lines 或 length-prefixed JSON frame。
-- 数据连接：每条公网连接对应一条 agent data connection。
-- 鉴权：agentId + token HMAC，或 mTLS。
-- 心跳：控制连接定期 ping/pong。
-```
-
-不建议第一版直接做：
-
-```text
-- 自研复杂多路复用。
-- UDP 转发。
-- HTTP 层代理语义。
-- payload 压缩或加密二次封装。
-- 业务协议识别。
-```
-
-后续如需提升连接密度，可以在协议稳定后引入多路复用，例如 QUIC stream、yamux 类 stream，或 WebSocket stream。
-
-## 6. 控制协议草案
-
-### 6.1 Register
-
-Agent 建立控制连接后，第一帧必须注册。
-
-```json
-{
-  "type": "register",
-  "version": 1,
-  "agentId": "agent-a",
-  "timestamp": 1790000000,
-  "nonce": "random",
-  "signature": "hmac-or-signature",
-  "capabilities": {
-    "maxConnections": 200,
-    "protocols": ["tcp"]
-  }
-}
-```
-
-服务端返回：
-
-```json
-{
-  "type": "register_result",
-  "ok": true,
-  "sessionId": "sess-...",
-  "heartbeatIntervalSeconds": 15,
-  "routes": ["route-main"]
-}
-```
-
-### 6.2 Heartbeat
-
-```json
-{
-  "type": "ping",
-  "sessionId": "sess-...",
-  "timestamp": 1790000015
-}
-```
-
-```json
-{
-  "type": "pong",
-  "sessionId": "sess-...",
-  "timestamp": 1790000015
-}
-```
-
-### 6.3 OpenConnection
-
-当公网入口收到新连接后，服务端向 agent 发起连接打开请求。
-
-```json
-{
-  "type": "open_connection",
-  "connectionId": "conn-...",
-  "routeId": "route-main",
-  "sourceAddress": "8.8.8.8",
-  "sourcePort": 45678,
-  "destinationAddress": "1.2.3.4",
-  "destinationPort": 7000
-}
-```
-
-这些 metadata 只描述公网侧连接事实。下游节点是否使用这些 metadata，由下游节点自行决定，中转服务器不依赖具体业务端行为。
-
-### 6.4 OpenConnectionResult
-
-```json
-{
-  "type": "open_connection_result",
-  "connectionId": "conn-...",
-  "ok": true,
-  "dataToken": "one-time-token"
-}
-```
-
-如果失败：
-
-```json
-{
-  "type": "open_connection_result",
-  "connectionId": "conn-...",
-  "ok": false,
-  "error": "capacity_exceeded"
-}
-```
-
-### 6.5 CloseConnection
-
-```json
-{
-  "type": "close_connection",
-  "connectionId": "conn-...",
-  "reason": "public_closed"
-}
-```
-
-## 7. 数据通道草案
-
-第一版建议每条公网连接使用一条独立数据连接，避免多路复用带来的队头阻塞、流控和半关闭复杂度。
-
-数据通道建立流程：
-
-```text
-1. 公网入口接收新 TCP 连接。
-2. 服务端生成 connectionId。
-3. 服务端通过控制连接发送 open_connection。
-4. Agent 返回 ok 和一次性 dataToken。
-5. Agent 主动连接服务端 data listener，并发送 dataToken。
-6. 服务端校验 dataToken，把 public socket 和 data socket 绑定。
-7. 双向 CopyLoop 透明转发。
-8. 任一侧关闭时，关闭另一侧并发送 close_connection。
-```
-
-数据连接握手帧示例：
-
-```json
-{
-  "type": "data_bind",
-  "connectionId": "conn-...",
-  "dataToken": "one-time-token"
-}
-```
-
-要求：
-
-```text
-- dataToken 必须短期有效，例如 10 秒。
-- dataToken 一次性使用。
-- data_bind 未通过认证前不转发任何公网数据。
-- public socket 可短暂暂停读取，等待 data channel 建立，避免内存堆积。
-```
-
-## 8. 服务端组件
-
-建议模块划分：
-
-```text
-cmd/server
-internal/config
-internal/auth
-internal/control
-internal/ingress
-internal/router
-internal/session
-internal/dataplane
-internal/metrics
-internal/logging
-```
-
-职责：
-
-```text
-config      - 读取 YAML/JSON 配置并校验端口冲突。
-auth        - agent 鉴权、token 校验、签名校验。
-control     - 控制连接监听、register、heartbeat、open/close 消息。
-ingress     - 公网 TCP 入口监听和 connectionId 生成。
-router      - routeId/listenPort 到 agent/session 的匹配。
-session     - agent session 生命周期、心跳超时、容量统计。
-dataplane   - data listener、dataToken、socket 绑定和 CopyLoop。
-metrics     - 连接数、流量、错误码、延迟统计。
-logging     - 结构化日志输出。
-```
-
-## 9. 配置文件
+中转服务器自己的配置应尽量薄，只描述 Xray 文件位置、配置文件位置和进程管理策略。
 
 示例：
 
 ```yaml
-server:
-  controlListen: "0.0.0.0:9000"
-  dataListen: "0.0.0.0:9001"
-  logLevel: "info"
-  shutdownTimeoutSeconds: 10
+xray:
+  executable: "./xray/xray"
+  config: "./configs/xray.server.json"
+  restartOnExit: true
+  restartDelaySeconds: 3
 
-security:
-  authMode: "hmac"
-  tokenFile: "config/agents.yaml"
-  requireTls: true
-  tlsCertFile: "config/server.crt"
-  tlsKeyFile: "config/server.key"
+logging:
+  level: "info"
+  file: "./logs/mid-transport-server.log"
 
-agents:
-  - agentId: "agent-a"
-    enabled: true
-    secretRef: "agent-a-secret"
-    allowedRoutes: ["route-main"]
-    maxSessions: 2
-    maxConnections: 200
-
-routes:
-  - routeId: "route-main"
-    enabled: true
-    listenAddress: "0.0.0.0"
-    listenPort: 7000
-    agentId: "agent-a"
-    maxConnections: 200
-    idleTimeoutSeconds: 300
-    connectTimeoutSeconds: 10
-    allowSourceCidrs: ["0.0.0.0/0"]
+health:
+  enabled: true
+  listen: "127.0.0.1:18080"
 ```
 
-配置校验要求：
+真正的协议、端口、加密、认证、转发目标，都放在 Xray 配置里。
+
+## 7. Xray 配置示例方向
+
+具体协议参数以后按实际链路确定，这里只定义方向。
 
 ```text
-- controlListen、dataListen、route listenPort 不能冲突。
-- route.agentId 必须存在且 enabled。
-- agent.allowedRoutes 必须包含对应 routeId。
-- listenPort 必须在 1..65535。
-- maxConnections 必须有限制。
-- requireTls 默认为 true。
+Xray inbound:
+  - 监听中转服务器公网端口
+  - 使用选定的 Xray 协议
+  - 负责认证和协议握手
+
+Xray outbound:
+  - 指向下一跳或目标地址
+  - 只转发 TCP 字节流
 ```
 
-## 10. 路由选择策略
+示意结构：
 
-第一版一个 route 绑定一个 agent。
+```json
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "public-in",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "按实际协议填写",
+      "settings": {}
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "next-hop",
+      "protocol": "按实际协议填写",
+      "settings": {}
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["public-in"],
+        "outboundTag": "next-hop"
+      }
+    ]
+  }
+}
+```
 
-如果同一 agent 有多个 session：
+注意：
 
 ```text
-- 优先选择 activeConnectionCount 最低的 session。
-- 跳过心跳超时 session。
-- 跳过超过 maxConnectionCount 的 session。
+- 认证、加密、传输层细节由 Xray 配置决定。
+- 中转服务程序不要读取或理解业务 payload。
+- 中转服务程序只需要知道 xray 是否启动成功、端口是否监听、配置是否有效。
 ```
 
-后续可扩展：
+## 8. 服务程序职责
+
+如果要写 `Mid_transport_server` 程序，职责限定为：
 
 ```text
-- 一个 route 多个 agent 负载均衡。
-- 权重调度。
-- 主备切换。
-- 灰度路由。
+1. 读取本地配置。
+2. 校验 xray executable 路径。
+3. 校验 xray config 路径。
+4. 调用 xray test 检查配置。
+5. 启动 xray。
+6. 监听进程退出。
+7. 按配置决定是否重启。
+8. 转发或保存 xray 日志。
+9. 提供本机 health check。
+10. 收到退出信号时停止 xray。
 ```
 
-## 11. 连接生命周期
-
-### 11.1 Public connection
+不要加入：
 
 ```text
-accepted
-  -> route matched
-  -> session selected
-  -> open_connection sent
-  -> data channel bound
-  -> forwarding
-  -> closing
-  -> closed
+- 自定义控制连接。
+- 自定义数据连接。
+- 连接配对逻辑。
+- 自定义认证逻辑。
+- 业务层路由逻辑。
 ```
 
-失败处理：
+这些都应该交给 Xray 协议和 Xray routing 完成。
+
+## 9. 最小目录结构
+
+建议第一版：
 
 ```text
-- route 不存在：直接关闭。
-- route disabled：直接关闭。
-- agent offline：直接关闭并记录 no_session。
-- agent 容量满：直接关闭并记录 capacity_exceeded。
-- data channel 超时：关闭 public socket。
+README.md
+MID_TRANSPORT_SERVER_IMPLEMENTATION_PLAN.md
+configs/
+  mid-transport.example.yaml
+  xray.server.example.json
+scripts/
+  validate-config.ps1
+  start.ps1
+  stop.ps1
 ```
 
-### 11.2 Session
+如果需要写服务程序，再新增：
 
 ```text
-connected
-  -> registered
-  -> active
-  -> heartbeat missed
-  -> draining
-  -> closed
+cmd/mid-transport-server/
+internal/config/
+internal/xray/
+internal/health/
+internal/logging/
 ```
 
-Session 关闭时：
+但第一版可以先不实现复杂代码。
+
+## 10. 启动流程
 
 ```text
-- 标记 session unavailable。
-- 关闭或迁移其绑定的 active connections。
-- 删除 pending dataToken。
-- 写入 summary 日志。
+1. 读取 mid-transport 配置。
+2. 检查 xray executable 是否存在。
+3. 检查 xray config 是否存在。
+4. 执行 xray run -test -config ./configs/xray.server.json。
+5. 测试通过后启动 xray。
+6. 写入启动日志。
+7. health check 返回 running。
 ```
 
-## 12. 转发实现要求
-
-CopyLoop 要求：
+## 11. 停止流程
 
 ```text
-- 双向转发使用独立 goroutine 或等价异步任务。
-- 任一方向 EOF 或错误，关闭整个 connection。
-- 支持半关闭时可以先简单全关闭，后续再优化。
-- 每条连接统计 bytesFromPublic / bytesToPublic。
-- idleTimeout 到期后关闭。
-- 单连接内存使用有上限。
+1. 收到退出信号。
+2. 向 xray 进程发送正常停止信号。
+3. 等待 xray 退出。
+4. 超时后强制结束。
+5. 写入退出日志。
 ```
 
-Buffer 建议：
+## 12. 日志
+
+最小日志即可：
 
 ```text
-- 32KB 或 64KB buffer。
-- 使用 buffer pool 降低 GC 压力。
-- 不缓存完整 payload。
+- config_loaded
+- xray_config_test_start
+- xray_config_test_success
+- xray_config_test_failed
+- xray_start
+- xray_exit
+- xray_restart
+- xray_stop
+- health_check_failed
 ```
 
-## 13. 安全要求
+不记录业务 payload，不记录密钥、token、证书内容。
 
-默认安全策略：
+## 13. 健康检查
 
-```text
-1. 控制连接必须鉴权。
-2. 生产环境 requireTls 默认 true。
-3. agent secret 不写入日志。
-4. dataToken 一次性、短 TTL、不可复用。
-5. route 必须显式绑定 agent，不能自动开放所有端口。
-6. 每个 route、agent、session 都有连接数上限。
-7. 支持 allowSourceCidrs 限制公网访问者来源。
-8. 控制消息大小有限制，避免内存攻击。
-9. 心跳超时必须清理 session。
-10. 不能把本服务变成无鉴权开放代理。
-```
-
-## 14. 日志与指标
-
-结构化日志字段：
-
-```text
-ts
-level
-event
-routeId
-agentId
-sessionId
-connectionId
-sourceAddress
-sourcePort
-destinationAddress
-destinationPort
-bytesFromPublic
-bytesToPublic
-reason
-error
-```
-
-关键事件：
-
-```text
-server_start
-route_listen_start
-agent_register_success
-agent_register_failed
-session_heartbeat_timeout
-public_connection_accepted
-open_connection_sent
-data_channel_bound
-connection_closed
-route_capacity_exceeded
-server_shutdown
-```
-
-最小指标：
-
-```text
-active_sessions
-active_connections
-connections_total
-connections_failed_total
-bytes_from_public_total
-bytes_to_public_total
-open_connection_latency_ms
-session_heartbeat_missed_total
-```
-
-## 15. 管理接口
-
-第一版可以不提供 HTTP 管理 API，只通过日志和配置文件运维。
-
-如果增加管理接口，建议只监听本机或内网，并提供：
+第一版只需要本机健康检查：
 
 ```text
 GET /healthz
-GET /readyz
-GET /metrics
-GET /routes
-GET /sessions
 ```
 
-管理接口不得提供无鉴权的动态开端口能力。
+返回：
 
-## 16. 部署方式
+```json
+{
+  "running": true,
+  "xrayPid": 1234,
+  "config": "./configs/xray.server.json"
+}
+```
 
-第一版部署形态：
+健康检查只监听 `127.0.0.1`，不对公网开放。
+
+## 14. 安全要求
 
 ```text
-Mid_transport_server binary
-config/server.yaml
-config/agents.yaml
-logs/
+1. Xray 协议认证由 Xray 配置负责。
+2. 中转服务程序不保存明文密钥到日志。
+3. 配置文件权限要限制。
+4. health check 默认只监听 127.0.0.1。
+5. 公网只开放 Xray inbound 需要的端口。
+6. 不实现无鉴权开放 TCP 转发。
+7. 不提供公网管理 API。
 ```
 
-系统要求：
+## 15. 验证计划
+
+第一版验证只做转发链路验证：
 
 ```text
-- 具备公网 IP 或公网端口映射。
-- 防火墙放行 route listenPort、controlListen、dataListen。
-- TLS 证书和 agent secret 通过配置挂载。
-- systemd / Windows Service / 容器部署任选其一，第一版优先 systemd 或容器。
+1. xray 配置语法测试通过。
+2. xray 能启动并监听指定端口。
+3. 客户端能通过 Xray 协议连到中转服务器。
+4. 流量能被转发到配置的下一跳。
+5. 停止服务后 xray 进程退出。
+6. xray 异常退出时按配置重启或记录失败。
 ```
 
-启动顺序：
+不要测试业务协议内容，因为中转服务器不理解业务。
+
+## 16. 分阶段实现
+
+### Phase 1：配置和部署文档
 
 ```text
-1. 读取配置。
-2. 校验端口、agent、route。
-3. 启动 control listener。
-4. 启动 data listener。
-5. 启动 route public listeners。
-6. 等待 agent 注册。
+- 提供 xray.server.example.json。
+- 提供 mid-transport.example.yaml。
+- 写清楚端口、防火墙、证书/密钥文件位置。
+- 提供手动启动命令。
 ```
 
-关闭顺序：
+### Phase 2：启停脚本
 
 ```text
-1. 停止接受新的 public connections。
-2. 停止接受新的 data channels。
-3. 通知 agent draining。
-4. 等待 active connections 在 shutdownTimeout 内结束。
-5. 强制关闭剩余连接。
-6. 写入 shutdown summary。
+- validate-config 脚本。
+- start 脚本。
+- stop 脚本。
+- 日志目录初始化。
 ```
 
-## 17. 测试计划
+### Phase 3：轻量服务封装
 
-### 17.1 配置校验测试
+仅在需要时实现：
 
 ```text
-- 端口冲突。
-- route 引用不存在 agent。
-- disabled agent。
-- 非法端口。
-- maxConnections 为 0 或负数。
-- TLS 配置缺失。
+- 读取配置。
+- 启动 xray。
+- 监控退出。
+- 本机 health check。
+- 优雅停止。
 ```
 
-### 17.2 鉴权测试
+### Phase 4：运维增强
 
 ```text
-- 正确 token 注册成功。
-- 错误 token 注册失败。
-- 过期 timestamp 注册失败。
-- 重放 nonce 注册失败。
-- disabled agent 注册失败。
+- systemd service。
+- Dockerfile。
+- 日志轮转示例。
+- 版本输出。
 ```
 
-### 17.3 路由测试
+## 17. 最小验收标准
 
 ```text
-- public connection 命中 route。
-- route disabled 时拒绝连接。
-- agent offline 时拒绝连接。
-- session 容量满时拒绝连接。
-- 多 session 时选择连接数较少的 session。
+1. 中转服务器能启动固定版本 Xray-core。
+2. Xray 配置测试通过后才启动。
+3. 公网入口端口由 Xray 监听。
+4. Xray 能把流量转发到配置的下一跳。
+5. 中转服务本身不解析、不修改 payload。
+6. 停止中转服务时 Xray 被正确停止。
+7. 本机 health check 能反映 Xray 是否运行。
 ```
 
-### 17.4 数据转发 smoke test
+## 18. 总结
+
+中转服务器服务端第一版应该保持很薄：
 
 ```text
-公网测试客户端 -> public listener -> fake agent -> echo server
+中转服务程序负责部署、配置、启动、停止和观察 Xray。
+Xray 负责协议、认证、加密、连接和转发。
+业务 payload 只作为 TCP 字节流经过，不被中转服务理解或修改。
 ```
 
-验证：
-
-```text
-- 双向字节一致。
-- 大包能持续转发。
-- 连接关闭后资源释放。
-- bytesFromPublic / bytesToPublic 正确。
-```
-
-### 17.5 稳定性测试
-
-```text
-- agent 控制连接断开时清理 session。
-- data channel 未按时绑定时清理 public connection。
-- public 端突然断开。
-- agent 端突然断开。
-- idleTimeout 自动关闭。
-```
-
-## 18. 分阶段实现建议
-
-### Phase 1：文档与协议确认
-
-确认服务端职责、route/session/connection 模型、控制协议和数据通道流程。
-
-### Phase 2：配置与日志骨架
-
-实现配置读取、校验、结构化日志、基础启动退出。
-
-### Phase 3：控制平面
-
-实现 control listener、agent register、heartbeat、session manager。
-
-### Phase 4：公网入口与路由
-
-实现 route public listener、route matching、session selection。
-
-### Phase 5：数据通道
-
-实现 data listener、dataToken、data_bind、public socket 与 data socket 绑定。
-
-### Phase 6：转发与清理
-
-实现双向 CopyLoop、超时、关闭传播、连接统计。
-
-### Phase 7：安全加固
-
-实现 TLS、HMAC/mTLS、nonce 防重放、连接数限制、source CIDR 限制。
-
-### Phase 8：可观测性与部署
-
-实现 healthz、metrics、systemd/container 部署文档和 smoke test。
-
-## 19. 最小验收标准
-
-第一版可接受的验收标准：
-
-```text
-1. 服务端能读取配置并启动 control/data/public 三类 listener。
-2. agent 使用正确凭据能注册 session。
-3. agent 心跳超时后 session 被清理。
-4. public connection 能根据 route 绑定到在线 session。
-5. data channel 使用一次性 dataToken 绑定 connection。
-6. 双向 TCP 字节流透明转发。
-7. public source/destination metadata 被记录并发送给 agent。
-8. route/agent/session 连接数限制生效。
-9. 关闭连接后 connection/session 计数正确回收。
-10. 日志能定位 routeId、agentId、sessionId、connectionId 和 close reason。
-```
-
-## 20. 不建议第一版实现的内容
-
-```text
-- 多路复用。
-- UDP。
-- HTTP 代理模式。
-- 动态公网端口自动开关。
-- 无鉴权 agent 自注册。
-- payload 压缩。
-- payload 加密二次封装。
-- 业务协议解析。
-- 与任意具体业务端仓库耦合。
-```
-
-## 21. 总结
-
-中转服务器服务端第一版应保持简单、透明、可运维：
-
-```text
-公网入口负责接收连接。
-控制平面负责认证 agent 和维护 session。
-路由表负责把入口端口绑定到 agent。
-数据通道负责透明转发字节流。
-日志和指标负责可观测性。
-```
-
-它不解析业务协议，也不依赖任何具体业务端实现。这样可以先把中转服务端能力稳定下来，再让不同下游节点按自己的方式接入。
+这样实现成本最低，也避免重复造一套 Xray 已经解决的问题。
