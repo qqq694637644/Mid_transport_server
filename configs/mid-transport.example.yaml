@@ -1,0 +1,25 @@
+xray:
+  releaseTag: "mt-v26.3.27"
+  installRoot: "./runtime/xray-mt"
+  autoDownload: true
+  restartOnExit: true
+  restartDelaySeconds: 3
+
+portal:
+  reverseListenAddress: "0.0.0.0"
+  reverseListenPort: 8443
+  publicListenAddress: "0.0.0.0"
+  publicMainPort: 7000
+  reverseCredentialId: "00000000-0000-0000-0000-000000000000"
+  reverseOutboundTag: "mt-reverse-out"
+  reverseInboundTag: "mt-vless-reverse"
+  publicMainInboundTag: "mt-public-main"
+
+health:
+  enabled: true
+  listenAddress: "127.0.0.1"
+  listenPort: 18080
+
+logging:
+  level: "info"
+  file: "./logs/mid-transport-server.log"
