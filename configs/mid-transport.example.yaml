@@ -10,7 +10,7 @@ portal:
   reverseListenPort: 8443
   publicListenAddress: "0.0.0.0"
   publicMainPort: 7000
-  reverseCredentialId: "00000000-0000-0000-0000-000000000000"
+  reverseCredentialId: "<MT_UUID>"
   reverseOutboundTag: "mt-reverse-out"
   reverseInboundTag: "mt-vless-reverse"
   publicMainInboundTag: "mt-public-main"

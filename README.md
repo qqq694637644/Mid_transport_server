@@ -10,7 +10,7 @@
 Copy-Item .\configs\mid-transport.example.yaml .\configs\mid-transport.yaml
 ```
 
-2. 把 `portal.reverseCredentialId` 改成和 C# 端一致的 UUID。
+2. 把 `portal.reverseCredentialId` 改成和 C# 端一致的随机 UUID。它不能保留为 `<MT_UUID>`，也不能使用全 0 UUID。
 
 3. 生成并检查 Xray 配置：
 
@@ -36,6 +36,7 @@ GET /status
 ## 固定约束
 
 - release tag 固定为 `mt-v26.3.27`。
+- `portal.reverseCredentialId` 是第一版可信 C# reverse client 的身份凭据，必须是非全 0 的随机 UUID。
 - Linux 使用 `xray-mt-linux-amd64.tar.gz` 中的 `xray`。
 - Windows 使用 `xray-mt-windows-amd64.zip` 中的 `xray.exe`。
 - Python 不解析、不修改业务 payload。

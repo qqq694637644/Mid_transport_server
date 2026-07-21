@@ -73,6 +73,44 @@ logging:
         with self.assertRaises(ConfigError):
             load_config(path)
 
+    def test_rejects_nil_reverse_credential_id(self):
+        path = self.write_config(
+            """
+xray:
+  releaseTag: "mt-v26.3.27"
+portal:
+  reverseListenPort: 8443
+  publicMainPort: 7000
+  reverseCredentialId: "00000000-0000-0000-0000-000000000000"
+health:
+  listenAddress: "127.0.0.1"
+  listenPort: 18080
+logging:
+  file: "./logs/test.log"
+"""
+        )
+        with self.assertRaises(ConfigError):
+            load_config(path)
+
+    def test_rejects_placeholder_reverse_credential_id(self):
+        path = self.write_config(
+            """
+xray:
+  releaseTag: "mt-v26.3.27"
+portal:
+  reverseListenPort: 8443
+  publicMainPort: 7000
+  reverseCredentialId: "<MT_UUID>"
+health:
+  listenAddress: "127.0.0.1"
+  listenPort: 18080
+logging:
+  file: "./logs/test.log"
+"""
+        )
+        with self.assertRaises(ConfigError):
+            load_config(path)
+
     def test_parse_sha256_text(self):
         digest = "0" * 64
         self.assertEqual(parse_sha256_text(f"{digest}  xray-mt-linux-amd64.tar.gz\n", "xray-mt-linux-amd64.tar.gz"), digest)

@@ -159,9 +159,11 @@ def _validate_uuid(value: str) -> None:
     if not _UUID_RE.match(value):
         raise ConfigError("portal.reverseCredentialId must be a valid UUID")
     try:
-        uuid.UUID(value)
+        parsed = uuid.UUID(value)
     except ValueError:
         raise ConfigError("portal.reverseCredentialId must be a valid UUID")
+    if parsed.int == 0:
+        raise ConfigError("portal.reverseCredentialId must not be the nil UUID")
 
 
 def load_config(path: str | Path) -> AppConfig:
