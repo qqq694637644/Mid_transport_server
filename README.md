@@ -31,6 +31,8 @@ GET /healthz
 GET /status
 ```
 
+`/healthz` 只表示 Xray 进程存活，不表示公网 reverse tunnel 已经可用。C# 内网侧 reverse mux 注册完成前，公网入口可能短暂出现 `non existing outTag`；`/status` 会暴露最近一次该类路由错误，便于判断是否还处于 reverse 注册前状态。
+
 ## 固定约束
 
 - release tag 固定为 `mt-v26.3.27`。

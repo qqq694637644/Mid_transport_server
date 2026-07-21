@@ -24,6 +24,7 @@ class XrayStatus:
     restart_on_exit: bool = False
     last_exit_code: Optional[int] = None
     last_error: Optional[str] = None
+    last_reverse_routing_error: Optional[str] = None
     started_at: Optional[float] = None
     restarts: int = 0
 
@@ -98,7 +99,10 @@ class XrayProcessManager:
             proc = self._process
             if proc.stdout is not None:
                 for line in proc.stdout:
-                    _LOG.info("xray_stdout %s", line.rstrip())
+                    text = line.rstrip()
+                    _LOG.info("xray_stdout %s", text)
+                    if "non existing outTag" in text:
+                        self.status.last_reverse_routing_error = text
                     if proc.poll() is not None:
                         break
             exit_code = proc.wait()

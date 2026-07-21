@@ -89,8 +89,7 @@ def _safe_extract_zip(archive: Path, target_dir: Path) -> None:
     with zipfile.ZipFile(archive) as zf:
         for member in zf.infolist():
             destination = (target_dir / member.filename).resolve()
-            if not str(destination).startswith(str(target_dir.resolve())):
-                raise AssetError(f"unsafe zip entry: {member.filename}")
+            _assert_safe_destination(destination, target_dir, f"unsafe zip entry: {member.filename}")
         zf.extractall(target_dir)
 
 
@@ -98,9 +97,15 @@ def _safe_extract_tar(archive: Path, target_dir: Path) -> None:
     with tarfile.open(archive, "r:gz") as tf:
         for member in tf.getmembers():
             destination = (target_dir / member.name).resolve()
-            if not str(destination).startswith(str(target_dir.resolve())):
-                raise AssetError(f"unsafe tar entry: {member.name}")
+            _assert_safe_destination(destination, target_dir, f"unsafe tar entry: {member.name}")
         tf.extractall(target_dir)
+
+
+def _assert_safe_destination(destination: Path, target_dir: Path, message: str) -> None:
+    try:
+        destination.resolve().relative_to(target_dir.resolve())
+    except ValueError as exc:
+        raise AssetError(message) from exc
 
 
 def _verify_inner_sha256s(install_dir: Path) -> None:
@@ -116,8 +121,7 @@ def _verify_inner_sha256s(install_dir: Path) -> None:
             continue
         expected, relative_name = parts[0].lower(), parts[1]
         candidate = (install_dir / relative_name).resolve()
-        if not str(candidate).startswith(str(install_dir.resolve())):
-            raise AssetError(f"unsafe SHA256SUMS entry: {relative_name}")
+        _assert_safe_destination(candidate, install_dir, f"unsafe SHA256SUMS entry: {relative_name}")
         if not candidate.exists() or candidate.is_dir():
             raise AssetError(f"SHA256SUMS entry missing: {relative_name}")
         actual = sha256_file(candidate)

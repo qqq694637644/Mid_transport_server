@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Dict, Any, Optional
+from typing import Dict, Any, Optional
 
 from .config import AppConfig
 from .xray_process import XrayProcessManager
@@ -48,6 +48,9 @@ class HealthServer:
                         {
                             "ok": status.running,
                             "xrayRunning": status.running,
+                            "scope": "xray process health only",
+                            "reverseTunnelReady": None,
+                            "reverseTunnelNote": "reverse tunnel readiness is not observable via this Xray process API",
                             "pid": status.pid,
                             "releaseTag": config.xray.release_tag,
                         },
@@ -65,6 +68,8 @@ class HealthServer:
                             "restartOnExit": status.restart_on_exit,
                             "lastExitCode": status.last_exit_code,
                             "lastError": status.last_error,
+                            "lastReverseRoutingError": status.last_reverse_routing_error,
+                            "readinessNote": "Xray running means process health only; public reverse routing may fail until the C# reverse tunnel registers.",
                             "restarts": status.restarts,
                         },
                     )

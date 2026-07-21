@@ -1,11 +1,13 @@
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from mid_transport_server.config import ConfigError, load_config
 from mid_transport_server.xray_config import build_portal_config
-from mid_transport_server.release_assets import parse_sha256_text
+from mid_transport_server.release_assets import parse_sha256_text, _safe_extract_zip
+from mid_transport_server.errors import AssetError
 
 
 VALID_UUID = "11111111-1111-4111-8111-111111111111"
@@ -74,6 +76,17 @@ logging:
     def test_parse_sha256_text(self):
         digest = "0" * 64
         self.assertEqual(parse_sha256_text(f"{digest}  xray-mt-linux-amd64.tar.gz\n", "xray-mt-linux-amd64.tar.gz"), digest)
+
+    def test_zip_extract_rejects_prefix_escape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "windows-amd64"
+            archive = root / "evil.zip"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr("../windows-amd64_evil/file.txt", "bad")
+
+            with self.assertRaises(AssetError):
+                _safe_extract_zip(archive, target)
 
 
 if __name__ == "__main__":
