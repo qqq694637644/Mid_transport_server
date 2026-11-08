@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+logs/*.log
+!logs/.gitkeep
+
+runtime/xray-mt/
+!runtime/.gitkeep
+
+configs/mid-transport.yaml
+configs/xray.portal.generated.json
